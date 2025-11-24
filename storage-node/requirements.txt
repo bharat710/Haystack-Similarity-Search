@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+redis
+aiofiles
+python-multipart
+python-logging-loki
+requests
+httpx
