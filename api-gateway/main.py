@@ -48,23 +48,50 @@ rabbitmq_channel = None
 rabbitmq_connection = None
 
 # --- Service Discovery & Dependencies ---
-def connect_to_rabbitmq():
-    """Connects to RabbitMQ with retry logic."""
-    global rabbitmq_channel, rabbitmq_connection
-    while True:
-        try:
-            logger.info("Connecting to RabbitMQ...")
-            rabbitmq_connection = pika.BlockingConnection(pika.ConnectionParameters(host=RABBITMQ_HOST))
-            rabbitmq_channel = rabbitmq_connection.channel()
-            rabbitmq_channel.queue_declare(queue=PHOTO_QUEUE, durable=True)
-            logger.info("Successfully connected to RabbitMQ and declared queue.")
-            break
-        except pika.exceptions.AMQPConnectionError as e:
-            logger.error(f"RabbitMQ connection failed: {e}. Retrying in 5 seconds...")
-            time.sleep(5)
-        except Exception as e:
-            logger.error(f"An unexpected error occurred during RabbitMQ connection: {e}. Retrying in 5 seconds...")
-            time.sleep(5)
+# def connect_to_rabbitmq():
+#     """Connects to RabbitMQ with retry logic."""
+#     global rabbitmq_channel, rabbitmq_connection
+#     while True:
+#         try:
+#             logger.info("Connecting to RabbitMQ...")
+#             rabbitmq_connection = pika.BlockingConnection(pika.ConnectionParameters(host=RABBITMQ_HOST))
+#             rabbitmq_channel = rabbitmq_connection.channel()
+#             rabbitmq_channel.queue_declare(queue=PHOTO_QUEUE, durable=True)
+#             logger.info("Successfully connected to RabbitMQ and declared queue.")
+#             break
+#         except pika.exceptions.AMQPConnectionError as e:
+#             logger.error(f"RabbitMQ connection failed: {e}. Retrying in 5 seconds...")
+#             time.sleep(5)
+#         except Exception as e:
+#             logger.error(f"An unexpected error occurred during RabbitMQ connection: {e}. Retrying in 5 seconds...")
+#             time.sleep(5)
+
+
+def publish_photo_to_queue(photo_id: str):
+    """Publish a single photo_id message to RabbitMQ, using a short-lived connection."""
+    try:
+        params = pika.ConnectionParameters(
+            host=RABBITMQ_HOST,
+            heartbeat=0,  # disable heartbeats for this short-lived publish connection
+        )
+        connection = pika.BlockingConnection(params)
+        channel = connection.channel()
+        channel.queue_declare(queue=PHOTO_QUEUE, durable=True)
+
+        channel.basic_publish(
+            exchange="",
+            routing_key=PHOTO_QUEUE,
+            body=photo_id,
+            properties=pika.BasicProperties(
+                delivery_mode=2,  # make message persistent
+            ),
+        )
+        logger.info(f"Published photo_id {photo_id} to RabbitMQ queue '{PHOTO_QUEUE}'")
+
+        connection.close()
+    except Exception as e:
+        logger.error(f"Failed to publish photo_id {photo_id} to RabbitMQ: {e}")
+
 
 @app.on_event("startup")
 def startup_event():
@@ -79,17 +106,26 @@ def startup_event():
         # The application can run, but idempotency and service discovery will fail.
         redis_client = None
     
-    connect_to_rabbitmq()
+    # connect_to_rabbitmq()
     # Start RabbitMQ connection in a separate thread to avoid blocking startup
     # rabbitmq_thread = threading.Thread(target=connect_to_rabbitmq, daemon=True)
     # rabbitmq_thread.start()
+
+import random
+
+def pick_instance(service_name: str):
+    nodes = redis_client.smembers(f"service:{service_name}")
+    if not nodes:
+        raise Exception(f"No live instances of {service_name}")
+    return random.choice(list(nodes))   # or apply RR, weights, etc
+
 
 def get_service_url(service_name: str) -> str:
     """Retrieves the URL of a service from Redis service discovery."""
     if not redis_client:
         raise HTTPException(status_code=503, detail="Service discovery (Redis) unavailable")
     
-    service_address = redis_client.get(f"service:{service_name}")
+    service_address = pick_instance(service_name)
     if not service_address:
         raise HTTPException(status_code=503, detail=f"Service '{service_name}' not found")
     
@@ -194,21 +230,22 @@ async def upload_photo(
         redis_client.set(idempotency_redis_key, photo_id, ex=IDEMPOTENCY_KEY_EXPIRY_SECONDS)
 
         # Publish message to RabbitMQ for AI processing
-        if rabbitmq_channel:
-            try:
-                rabbitmq_channel.basic_publish(
-                    exchange='',
-                    routing_key=PHOTO_QUEUE,
-                    body=f"{volume_id}/{photo_id}",
-                    properties=pika.BasicProperties(
-                        delivery_mode=2,  # make message persistent
-                    )
-                )
-                logger.info(f"Published photo_id {photo_id} to RabbitMQ queue '{PHOTO_QUEUE}'")
-            except Exception as e:
-                logger.error(f"Failed to publish photo_id {photo_id} to RabbitMQ: {e}")
-        else:
-            logger.error(f"RabbitMQ channel not available to publish photo_id {photo_id}")
+        publish_photo_to_queue(f"{storage_node_urls[0]}/{volume_id}/{photo_id}")
+        # if rabbitmq_channel:
+        #     try:
+        #         rabbitmq_channel.basic_publish(
+        #             exchange='',
+        #             routing_key=PHOTO_QUEUE,
+        #             body=f"{volume_id}/{photo_id}",
+        #             properties=pika.BasicProperties(
+        #                 delivery_mode=2,  # make message persistent
+        #             )
+        #         )
+        #         logger.info(f"Published photo_id {photo_id} to RabbitMQ queue '{PHOTO_QUEUE}'")
+        #     except Exception as e:
+        #         logger.error(f"Failed to publish photo_id {photo_id} to RabbitMQ: {e}")
+        # else:
+        #     logger.error(f"RabbitMQ channel not available to publish photo_id {photo_id}")
         
         logger.info(f"Successfully committed photo {photo_id}.")
         return {"status": "upload successful", "photo_id": photo_id}

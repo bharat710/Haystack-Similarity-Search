@@ -32,4 +32,5 @@ docker run -d \
   -e RABBITMQ_HOST="rabbitmq" \
   -e STORAGE_NODE_URL="http://storage-node:8080" \
   -e SEARCH_SERVICE_URL="http://search-service:8000" \
+  -e HOSTNAME="ai-worker-${NAME}" \
   "${IMAGE}"

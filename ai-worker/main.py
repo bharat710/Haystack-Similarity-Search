@@ -59,13 +59,14 @@ def load_model():
 def process_photo_callback(ch, method, properties, body):
     """The core function to process a photo from the queue."""
     photo_id = body.decode('utf-8')
-    logical_id = photo_id.split('/')[0]
-    photo_id = photo_id.split('/')[1]
+    node_url = photo_id.split('/')[0]
+    logical_id = photo_id.split('/')[1]
+    photo_id = photo_id.split('/')[2]
     logger.info(f"Received job for photo_id: {photo_id}")
 
     # 1. Download image from Storage Node
     try:
-        response = requests.get(f"{STORAGE_NODE_URL}/photos/{logical_id}/{photo_id}", timeout=30)
+        response = requests.get(f"http://{node_url}/photos/{logical_id}/{photo_id}", timeout=30)
         response.raise_for_status()
         payload = response.json()
         b64_data = payload["data"]

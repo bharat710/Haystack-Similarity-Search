@@ -6,6 +6,9 @@ from pydantic import BaseModel # Import BaseModel
 from cachetools import TTLCache # Import TTLCache
 import asyncio # Import asyncio
 import json # Import json
+import threading
+import time
+import os
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse # Ensure JSONResponse is imported
@@ -31,6 +34,8 @@ app = FastAPI()
 # --- Globals ---
 REDIS_HOST = "redis"
 REDIS_PORT = 6379
+HOSTNAME = os.environ.get("HOSTNAME")
+HEARTBEAT_TTL=60
 
 # In-memory cache using cachetools
 # Cache photos for 5 minutes (300 seconds), max 1000 entries
@@ -172,13 +177,38 @@ def delete_from_cache(photo_id: str):
 
 
 
+#-FIXED-
 # --- Startup ---
+
+def heartbeat():
+    """Sends a heartbeat to Redis every HEARTBEAT_TTL/2 seconds."""
+    while True:
+        try:
+            if discovery_client:
+                # Register the service and set a TTL on the heartbeat key
+                service_key = f"service:cache-service"
+                service_address = f"{HOSTNAME}:8080"
+                heartbeat_key = f"heartbeat:{service_address}"
+
+                # Add to the set of available services
+                discovery_client.sadd(service_key, service_address)
+                # Set/refresh the heartbeat key with a TTL
+                discovery_client.set(heartbeat_key, "1", ex=HEARTBEAT_TTL)
+                logger.info(f"Sent heartbeat for {service_address}")
+        except redis.exceptions.RedisError as e:
+            logger.error(f"Error sending heartbeat: {e}")
+        # Sleep for half the TTL duration
+        time.sleep(HEARTBEAT_TTL / 2)
+
 
 @app.on_event("startup")
 def startup_event():
-    """On startup, register with service discovery."""
-    if discovery_client:
-        discovery_client.set("service:cache-service", "cache-service:8080")
+    """On startup, register with service discovery and start heartbeat."""
+    # Start the heartbeat thread in the background
+    heartbeat_thread = threading.Thread(target=heartbeat, daemon=True)
+    heartbeat_thread.start()
+    logger.info("Heartbeat thread started.")
+
 
 if __name__ == "__main__":
     import uvicorn

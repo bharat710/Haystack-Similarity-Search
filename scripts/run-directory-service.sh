@@ -30,4 +30,5 @@ docker run -d \
   --network "${NETWORK}" \
   -e DATABASE_URL="postgresql://user:password@metadata_db:5432/metadata" \
   -e PYTHONUNBUFFERED=1 \
+  -e HOSTNAME="directory-service-${NAME}" \
   "${IMAGE}"

@@ -15,7 +15,8 @@ services:
       - PYTHONUNBUFFERED=1
     depends_on:
       - directory-service
-      - storage-node
+      - storage-node-1
+      - storage-node-2
       - search-service
       - cache-service
       - redis
@@ -24,11 +25,13 @@ services:
   directory-service:
     build:
       context: ./directory-service
+    hostname: directory-service-1
     volumes:
       - ./directory-service:/app
     environment:
       - DATABASE_URL=postgresql://user:password@metadata_db:5432/metadata
       - PYTHONUNBUFFERED=1
+      - HOSTNAME=directory-service-1
     depends_on:
       metadata_db:
         condition: service_healthy
@@ -36,20 +39,34 @@ services:
         condition: service_started
 
 
-  storage-node:
+  storage-node-1:
     build:
       context: ./storage-node
+    hostname: storage-node-1
     volumes:
-      - ./storage-node/data:/data
-      - ./storage-node:/app
-    ports:
-      - "8081:8080" # Expose storage node for direct access if needed
+      - ./storage-node/data1:/data       # unique data folder
     environment:
       - PYTHONUNBUFFERED=1
       - STORAGE_PATH=/data
+      - HOSTNAME=storage-node-1
     depends_on:
       - redis
       - directory-service
+
+  storage-node-2:
+    build:
+      context: ./storage-node
+    hostname: storage-node-2
+    volumes:
+      - ./storage-node/data2:/data       # unique data folder
+    environment:
+      - PYTHONUNBUFFERED=1
+      - STORAGE_PATH=/data
+      - HOSTNAME=storage-node-2
+    depends_on:
+      - redis
+      - directory-service
+
 
   search-service:
     build:
@@ -69,12 +86,14 @@ services:
   cache-service:
     build:
       context: ./cache-service
+    hostname: cache-service-1
     volumes:
       - ./cache-service:/app
     ports:
       - "8082:8080"
     environment:
       - PYTHONUNBUFFERED=1
+      - HOSTNAME=cache-service-1
     depends_on:
       - redis
       - directory-service # It needs to know which writes are happening
@@ -99,10 +118,12 @@ services:
       - RABBITMQ_HOST=rabbitmq
       - STORAGE_NODE_URL=http://storage-node:8080
       - SEARCH_SERVICE_URL=http://search-service:8000
+      - HOSTNAME=ai-worker-1
     depends_on:
       - rabbitmq
       - search-service
-      - storage-node
+      - storage-node-1
+      - storage-node-2
 
   # ------------------
   # Databases

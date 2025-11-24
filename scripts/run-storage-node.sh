@@ -37,4 +37,5 @@ docker run -d \
   -v "$(pwd)/${DATA_DIR}:/data" \
   -e PYTHONUNBUFFERED=1 \
   -e STORAGE_PATH=/data \
+  -e HOSTNAME="storage-node-${NAME}" \
   "${IMAGE}"

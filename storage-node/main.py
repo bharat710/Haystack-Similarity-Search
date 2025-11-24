@@ -5,11 +5,13 @@ import aiofiles
 import requests
 import time
 import asyncio
+import threading
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.responses import JSONResponse # Import JSONResponse
 import logging
 import logging_loki
-import base64 # Import base64
+import base64
+import json
 
 # --- Setup ---
 handler = logging_loki.LokiHandler(
@@ -30,9 +32,21 @@ STORAGE_PATH = os.environ.get("STORAGE_PATH", "/data")
 DIRECTORY_SERVICE_URL = "http://directory-service:8000"
 storage_node_id = os.environ.get("HOSTNAME","storage-node")+":8080"
 MY_URL = f"http://{storage_node_id}" # How this node is reachable from other services
+INDEX_FILE = os.path.join(STORAGE_PATH, "index.jsonl")
 
 volume_locks = {}
 redis_client = None
+
+
+async def append_to_index(photo_id: str, metadata: dict):
+    """Appends a metadata entry to the index file."""
+    try:
+        # Include the photo_id in the record
+        record = {"photo_id": photo_id, **metadata}
+        async with aiofiles.open(INDEX_FILE, "a") as f:
+            await f.write(json.dumps(record) + "\n")
+    except Exception as e:
+        logger.error(f"Failed to append to index file for photo {photo_id}: {e}")
 
 # --- API Endpoints ---
 @app.get("/")
@@ -147,6 +161,7 @@ async def upload_photo(volume_id: str, photo_id: str, file: UploadFile = File(..
                 "status": "active" # New status field
             }
             redis_client.hset(f"photo_metadata:{photo_id}", mapping=metadata_to_save)
+            await append_to_index(photo_id, metadata_to_save) # Also save to index
 
             logger.info(f"Saved photo {photo_id} to {volume_path} at offset {offset}, size {size}")
             return {"status": "saved", "photo_id": photo_id, **metadata_to_save}
@@ -172,6 +187,7 @@ async def delete_photo(photo_id: str):
     try:
         # Mark the photo as deleted
         redis_client.hset(metadata_key, "status", "deleted")
+        await append_to_index(photo_id, {"status": "deleted"})
         
         # We can also retrieve the volume_id to potentially trigger
         # a check for compaction later
@@ -236,6 +252,7 @@ async def compact_volume(volume_id: str):
                             pipeline.hset(key, "offset", new_offset)
                             # You might also want to update the volume_id if you change it, but here we don't.
                             pipeline.execute()
+                            await append_to_index(photo_id, {"offset": new_offset})
 
                             logger.debug(f"Copied {photo_id} to new volume. New offset: {new_offset}")
                             
@@ -285,16 +302,65 @@ def register_with_directory():
             logger.warning(f"Failed to register with Directory Service: {e}. Retrying in 5s...")
             time.sleep(5)
 
+def recover_metadata_from_index():
+    """Reads the index file and repopulates Redis with metadata."""
+    if not os.path.exists(INDEX_FILE):
+        logger.info("Index file not found. Skipping recovery.")
+        return
+
+    logger.info("Starting metadata recovery from index file...")
+    try:
+        with open(INDEX_FILE, "r") as f:
+            for line in f:
+                try:
+                    record = json.loads(line)
+                    photo_id = record.pop("photo_id")
+                    
+                    # Update Redis
+                    metadata_key = f"photo_metadata:{photo_id}"
+                    redis_client.hset(metadata_key, mapping=record)
+                    logger.debug(f"Recovered metadata for photo {photo_id}")
+                except json.JSONDecodeError:
+                    logger.warning(f"Skipping corrupt line in index file: {line.strip()}")
+                except Exception as e:
+                    logger.error(f"Error processing record for photo {photo_id}: {e}")
+        logger.info("Metadata recovery complete.")
+    except Exception as e:
+        logger.error(f"Failed to read or process index file: {e}")
+
+
+#-FIXED-
+def heartbeat_to_directory():
+    """Periodically sends a heartbeat to the directory service."""
+    # The heartbeat interval should be less than the stale threshold on the directory service
+    HEARTBEAT_INTERVAL_SECONDS = 30 
+    
+    while True:
+        try:
+            response = requests.post(f"{DIRECTORY_SERVICE_URL}/heartbeat", json={"url": storage_node_id})
+            response.raise_for_status()
+            logger.info("Successfully sent heartbeat to Directory Service.")
+        except requests.exceptions.RequestException as e:
+            logger.warning(f"Failed to send heartbeat to Directory Service: {e}.")
+        
+        time.sleep(HEARTBEAT_INTERVAL_SECONDS)
+
+
 @app.on_event("startup")
 def startup_event():
-    """On startup, connect to dependencies and register service."""
+    """On startup, connect to dependencies, register service, and start heartbeats."""
     connect_to_redis()
     
-    # Also register with the directory service
-    register_with_directory()
+    # Recover metadata before registering
+    recover_metadata_from_index()
 
-    # Old service discovery via Redis (can be a fallback or removed)
-    redis_client.set(f"service:storage-node", MY_URL)
+    # Register with the directory service immediately
+    register_with_directory()
+    
+    # Start the heartbeat thread in the background
+    heartbeat_thread = threading.Thread(target=heartbeat_to_directory, daemon=True)
+    heartbeat_thread.start()
+    logger.info("Heartbeat thread to directory service started.")
 
     os.makedirs(STORAGE_PATH, exist_ok=True)
     logger.info(f"Storage path '{STORAGE_PATH}' ensured.")

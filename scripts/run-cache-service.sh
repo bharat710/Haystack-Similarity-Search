@@ -29,4 +29,5 @@ docker run -d \
   --name "cache-service-${NAME}" \
   --network "${NETWORK}" \
   -e PYTHONUNBUFFERED=1 \
+  -e HOSTNAME="cache-service-${NAME}" \
   "${IMAGE}"
