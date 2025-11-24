@@ -16,7 +16,7 @@ import json
 # --- Setup ---
 handler = logging_loki.LokiHandler(
     url="http://loki:3100/loki/api/v1/push",
-    tags={"application": "storage-node"},
+    tags={"application": f"{os.environ.get("HOSTNAME","storage-node")}"},
     version="1",
 )
 logger = logging.getLogger("storage-node-logger")

@@ -19,9 +19,10 @@ class CacheLookupRequest(BaseModel):
     logical_volume_id: str
     storage_nodes: list[str]
 
+HOSTNAME = os.environ.get("HOSTNAME")
 handler = logging_loki.LokiHandler(
     url="http://loki:3100/loki/api/v1/push",
-    tags={"application": "cache-service"},
+    tags={"application": f"{HOSTNAME}"},
     version="1",
 )
 
@@ -34,7 +35,6 @@ app = FastAPI()
 # --- Globals ---
 REDIS_HOST = "redis"
 REDIS_PORT = 6379
-HOSTNAME = os.environ.get("HOSTNAME")
 HEARTBEAT_TTL=60
 
 # In-memory cache using cachetools

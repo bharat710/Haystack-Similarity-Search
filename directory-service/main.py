@@ -30,9 +30,10 @@ class NodeHeartbeatRequest(BaseModel):
 
 
 # --- Setup ---
+HOSTNAME = os.environ.get("HOSTNAME")
 handler = logging_loki.LokiHandler(
     url="http://loki:3100/loki/api/v1/push",
-    tags={"application": "directory-service"},
+    tags={"application": f"{HOSTNAME}"},
     version="1",
 )
 logger = logging.getLogger("directory-service-logger")
@@ -46,7 +47,6 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 REDIS_HOST = "redis"
 REDIS_PORT = 6379
 VOLUME_MAX_SIZE_BYTES = 100 * 1024 * 1024  # 100MB
-HOSTNAME = os.environ.get("HOSTNAME")
 HEARTBEAT_TTL=60
 
 # This redis client is for service discovery
