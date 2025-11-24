@@ -93,6 +93,7 @@ def create_db_tables(conn):
                     photo_id VARCHAR(255) PRIMARY KEY,
                     volume_id VARCHAR(255) REFERENCES logical_volumes(volume_id),
                     size_bytes BIGINT NOT NULL,
+                    status VARCHAR(20) DEFAULT 'active' NOT NULL,
                     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
                 );
             """)
@@ -233,13 +234,17 @@ async def lookup_photo(photo_id: str, db: psycopg2.extensions.connection = Depen
     Looks up the logical volume and storage nodes for a given photo_id.
     """
     with db.cursor(cursor_factory=DictCursor) as cur:
-        # 1. Get volume_id for the photo_id
-        cur.execute("SELECT volume_id FROM photos WHERE photo_id = %s", (photo_id,))
+        # 1. Get volume_id for the photo_id, ensuring it's not marked as deleted
+        cur.execute("SELECT volume_id, status FROM photos WHERE photo_id = %s", (photo_id,))
         photo_record = cur.fetchone()
 
         if not photo_record:
             logger.warning(f"Photo ID {photo_id} not found in directory service.")
             raise HTTPException(status_code=404, detail="Photo mapping not found")
+
+        if photo_record['status'] == 'deleted':
+            logger.warning(f"Attempt to look up a deleted photo: {photo_id}")
+            raise HTTPException(status_code=404, detail="Photo has been deleted")
 
         volume_id = photo_record['volume_id']
 
@@ -262,6 +267,46 @@ async def lookup_photo(photo_id: str, db: psycopg2.extensions.connection = Depen
             "logical_volume_id": volume_id,
             "storage_nodes": storage_node_urls
         }
+
+
+@app.post("/mark_deleted/{photo_id}")
+def mark_deleted(photo_id: str, db: psycopg2.extensions.connection = Depends(get_db)):
+    """Marks a photo as 'deleted' in the directory service."""
+    with db.cursor() as cur:
+        try:
+            # Check if the photo exists first
+            cur.execute("SELECT status FROM photos WHERE photo_id = %s", (photo_id,))
+            record = cur.fetchone()
+
+            if not record:
+                raise HTTPException(status_code=404, detail="Photo not found")
+            
+            if record[0] == 'deleted':
+                # Idempotency: if already deleted, just return success
+                logger.info(f"Photo {photo_id} is already marked as deleted.")
+                return {"status": "success", "message": "Photo already marked as deleted."}
+
+            # Update the status to 'deleted'
+            cur.execute(
+                "UPDATE photos SET status = 'deleted' WHERE photo_id = %s",
+                (photo_id,)
+            )
+            db.commit()
+            
+            # Optionally, you can also update the volume size here to reclaim space logically
+            # but that might be better handled by a separate background job
+            
+            logger.info(f"Successfully marked photo {photo_id} as deleted.")
+            return {"status": "success", "message": f"Photo {photo_id} marked as deleted."}
+        
+        except HTTPException:
+            # Re-raise HTTP exceptions to let FastAPI handle them
+            raise
+        except Exception as e:
+            db.rollback()
+            logger.error(f"Failed to mark photo {photo_id} as deleted: {e}")
+            raise HTTPException(status_code=500, detail="Failed to update photo status")
+
 
 
 # --- Startup ---

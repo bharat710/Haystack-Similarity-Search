@@ -51,6 +51,11 @@ async def get_photo(logical_volume_id: str, photo_id: str): # Modified function 
         raise HTTPException(status_code=404, detail="Photo not found")
 
     try:
+        # Check if photo is marked as deleted
+        if metadata.get('status') == 'deleted':
+            logger.warning(f"Attempted to access a deleted photo: {photo_id}")
+            raise HTTPException(status_code=404, detail="Photo has been deleted")
+
         # Validate that the requested logical_volume_id matches the one in metadata
         stored_volume_id = metadata.get('volume_id')
         if stored_volume_id != logical_volume_id:
@@ -139,6 +144,7 @@ async def upload_photo(volume_id: str, photo_id: str, file: UploadFile = File(..
                 "volume_id": volume_id,
                 "offset": offset,
                 "size": size,
+                "status": "active" # New status field
             }
             redis_client.hset(f"photo_metadata:{photo_id}", mapping=metadata_to_save)
 
@@ -147,6 +153,110 @@ async def upload_photo(volume_id: str, photo_id: str, file: UploadFile = File(..
         except Exception as e:
             logger.error(f"Error saving photo {photo_id}: {e}")
             raise HTTPException(status_code=500, detail=f"Failed to save photo: {e}")
+
+
+
+@app.delete("/photos/{photo_id}")
+async def delete_photo(photo_id: str):
+    """Marks a photo as 'deleted' in its metadata."""
+    if not redis_client:
+        raise HTTPException(status_code=503, detail="Storage metadata service (Redis) unavailable")
+
+    metadata_key = f"photo_metadata:{photo_id}"
+    
+    # Check if the photo exists
+    if not redis_client.exists(metadata_key):
+        logger.warning(f"Delete request for non-existent photo {photo_id}")
+        raise HTTPException(status_code=404, detail="Photo not found")
+        
+    try:
+        # Mark the photo as deleted
+        redis_client.hset(metadata_key, "status", "deleted")
+        
+        # We can also retrieve the volume_id to potentially trigger
+        # a check for compaction later
+        volume_id = redis_client.hget(metadata_key, "volume_id")
+
+        logger.info(f"Marked photo {photo_id} in volume {volume_id} as deleted.")
+        return {"status": "marked for deletion", "photo_id": photo_id}
+    except Exception as e:
+        logger.error(f"Error marking photo {photo_id} as deleted: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to mark photo for deletion: {e}")
+
+
+@app.post("/compact/{volume_id}")
+async def compact_volume(volume_id: str):
+    """
+    Performs compaction on a volume: copies active needles to a new file 
+    and atomically swaps it with the old one.
+    """
+    if not redis_client:
+        raise HTTPException(status_code=503, detail="Storage metadata service (Redis) unavailable")
+
+    volume_path = os.path.join(STORAGE_PATH, f"{volume_id}.dat")
+    if not os.path.exists(volume_path):
+        raise HTTPException(status_code=404, detail=f"Volume {volume_id} not found.")
+
+    # Define paths for new and temp files
+    new_volume_path = os.path.join(STORAGE_PATH, f"{volume_id}.new")
+    
+    # Get a lock for the volume to prevent writes during compaction
+    if volume_id not in volume_locks:
+        volume_locks[volume_id] = asyncio.Lock()
+    lock = volume_locks[volume_id]
+
+    async with lock:
+        logger.info(f"Starting compaction for volume {volume_id}...")
+        try:
+            new_offset = 0
+            # Open the new file to write to and old file to read from
+            async with aiofiles.open(new_volume_path, "wb") as new_f:
+                # Scan all photo metadata keys in Redis
+                for key in redis_client.scan_iter("photo_metadata:*"):
+                    photo_id = key.split(":")[-1]
+                    metadata = redis_client.hgetall(key)
+                    
+                    # Check if the photo belongs to the volume being compacted and is not deleted
+                    if metadata.get('volume_id') == volume_id and metadata.get('status') != 'deleted':
+                        try:
+                            original_offset = int(metadata['offset'])
+                            original_size = int(metadata['size'])
+                            
+                            # Read the needle from the old volume
+                            async with aiofiles.open(volume_path, "rb") as old_f:
+                                await old_f.seek(original_offset)
+                                needle_data = await old_f.read(original_size)
+                            
+                            # Write the needle to the new volume
+                            await new_f.write(needle_data)
+                            
+                            # Update metadata in Redis with the new offset
+                            # Use a pipeline for atomic update
+                            pipeline = redis_client.pipeline()
+                            pipeline.hset(key, "offset", new_offset)
+                            # You might also want to update the volume_id if you change it, but here we don't.
+                            pipeline.execute()
+
+                            logger.debug(f"Copied {photo_id} to new volume. New offset: {new_offset}")
+                            
+                            new_offset += original_size
+                        except (KeyError, ValueError, TypeError) as e:
+                            logger.error(f"Skipping photo {photo_id} due to corrupt metadata: {e}")
+                            continue
+
+            # --- Atomic Swap ---
+            # This is the critical step. os.rename is atomic on POSIX systems.
+            os.rename(new_volume_path, volume_path)
+            
+            logger.info(f"Compaction successful for volume {volume_id}. New size: {new_offset} bytes.")
+            return {"status": "compaction complete", "volume_id": volume_id, "new_size": new_offset}
+
+        except Exception as e:
+            logger.error(f"Compaction failed for volume {volume_id}: {e}", exc_info=True)
+            # Cleanup the .new file if it exists
+            if os.path.exists(new_volume_path):
+                os.remove(new_volume_path)
+            raise HTTPException(status_code=500, detail=f"Compaction failed: {e}")
 
 
 # --- Startup ---

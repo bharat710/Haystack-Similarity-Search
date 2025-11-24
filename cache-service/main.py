@@ -127,6 +127,51 @@ async def cache_lookup(request: CacheLookupRequest):
     raise HTTPException(status_code=404, detail="Photo not found in cache or on storage nodes")
 
 
+@app.delete("/cache/{photo_id}")
+def delete_from_cache(photo_id: str):
+    """
+    Deletes a photo from both the in-memory and Redis caches.
+    This is an idempotent operation.
+    """
+    in_memory_deleted = False
+    redis_deleted_count = 0
+    
+    # 1. Delete from in-memory cache
+    if photo_id in in_memory_cache:
+        try:
+            del in_memory_cache[photo_id]
+            in_memory_deleted = True
+            logger.info(f"Deleted {photo_id} from in-memory cache.")
+        except KeyError:
+            # This could happen in a race condition, it's fine.
+            logger.info(f"{photo_id} was already removed from in-memory cache, likely by another process.")
+            pass # Already deleted
+
+    # 2. Delete from Redis cache
+    if image_cache:
+        try:
+            # The `delete` method returns the number of keys deleted.
+            redis_deleted_count = image_cache.delete(photo_id)
+            if redis_deleted_count > 0:
+                logger.info(f"Deleted {photo_id} from Redis cache.")
+        except redis.exceptions.RedisError as e:
+            # Log the error but don't fail the request, as the primary goal is deletion
+            # and one of the caches might have succeeded.
+            logger.error(f"Error deleting {photo_id} from Redis cache: {e}")
+            # Depending on the desired robustness, you might want to raise an HTTPException here
+            raise HTTPException(status_code=500, detail=f"Failed to delete key from Redis: {e}")
+
+
+    # 3. Report result
+    if in_memory_deleted or redis_deleted_count > 0:
+        return {"status": "success", "message": f"Photo {photo_id} removed from cache."}
+    else:
+        # If it wasn't in either cache, it's not an error. The state is consistent.
+        logger.info(f"Attempted to delete {photo_id}, but it was not found in any cache.")
+        raise HTTPException(status_code=404, detail=f"Photo {photo_id} not found in cache.")
+
+
+
 # --- Startup ---
 
 @app.on_event("startup")

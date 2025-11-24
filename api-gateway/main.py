@@ -272,6 +272,95 @@ async def get_photo(photo_id: str):
             raise HTTPException(status_code=500, detail="An unexpected internal error occurred.")
 
 
+@app.delete("/photos/{photo_id}")
+async def delete_photo(photo_id: str):
+    """
+    Deletes a photo by its ID from the Haystack system.
+    Orchestrates calls to Directory Service, Cache Service, and Storage Nodes.
+    """
+    directory_service_url = get_service_url("directory-service")
+    cache_service_url = get_service_url("cache-service")
+
+    async with httpx.AsyncClient(timeout=HTTP_CLIENT_TIMEOUT) as client:
+        try:
+            # 1. Query Directory Service for photo location
+            directory_response = await client.get(f"{directory_service_url}/lookup/{photo_id}")
+            directory_response.raise_for_status()
+            location_info = directory_response.json()
+            
+            storage_nodes = location_info.get("storage_nodes")
+
+            if not storage_nodes:
+                logger.error(f"Directory service returned incomplete location info for {photo_id}: {location_info}")
+                raise HTTPException(status_code=500, detail="Incomplete location information from directory service")
+
+            # 2. Delete from Cache Service and Storage Nodes in parallel
+            tasks = []
+            
+            # Task to delete from cache
+            tasks.append(client.delete(f"{cache_service_url}/cache/{photo_id}"))
+            
+            # Tasks to delete from storage nodes
+            for node_url in storage_nodes:
+                tasks.append(client.delete(f"http://{node_url}/photos/{photo_id}"))
+
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            # --- Error Handling ---
+            failed_tasks = [res for res in results if isinstance(res, Exception)]
+            if failed_tasks:
+                # Log errors for each failed request
+                for i, res in enumerate(results):
+                    if isinstance(res, Exception):
+                        task_description = f"Cache deletion for {photo_id}" if i == 0 else f"Storage node deletion for {photo_id} at {storage_nodes[i-1]}"
+                        
+                        if isinstance(res, httpx.HTTPStatusError):
+                            # Handle HTTP errors (e.g., 404, 500)
+                            logger.error(f"{task_description} failed with status {res.response.status_code}: {res.response.text}")
+                        elif isinstance(res, httpx.RequestError):
+                            # Handle network/connection errors
+                            logger.error(f"{task_description} failed with request error: {res}")
+                        else:
+                            # Handle other unexpected exceptions
+                            logger.error(f"An unexpected error occurred during {task_description}: {res}", exc_info=True)
+                
+                # Optionally, attempt to rollback or queue for retry here
+                
+                # Check if all failed, or just some
+                if len(failed_tasks) == len(tasks):
+                    raise HTTPException(status_code=502, detail="Failed to delete photo from all services.")
+                else:
+                    # Partial success - might be okay, but needs monitoring
+                    logger.warning(f"Photo {photo_id} was partially deleted. Some services failed.")
+                    # Return a 207 Multi-Status or a 200 OK depending on desired behavior
+                    return JSONResponse(status_code=207, content={"message": "Photo deletion partially successful. Some services failed."})
+
+
+            # --- Mark as deleted in Directory Service ---
+            # This is an important step to prevent the photo from being "resurrected"
+            # if a lookup happens before compaction.
+            commit_response = await client.post(f"{directory_service_url}/mark_deleted/{photo_id}")
+            commit_response.raise_for_status()
+
+
+            logger.info(f"Successfully initiated deletion for photo {photo_id}")
+            return {"status": "deletion initiated"}
+
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                logger.warning(f"Photo {photo_id} not found in directory service for deletion.")
+                raise HTTPException(status_code=404, detail="Photo not found")
+            else:
+                logger.error(f"HTTP error during photo deletion for {photo_id}: {e.response.status_code} - {e.response.text}")
+                raise HTTPException(status_code=502, detail=f"Error communicating with backend service: {e.response.text}")
+        except httpx.RequestError as e:
+            logger.error(f"Network error during photo deletion for {photo_id}: {e}")
+            raise HTTPException(status_code=503, detail="Backend service unreachable")
+        except Exception as e:
+            logger.error(f"An unexpected error occurred during photo deletion for {photo_id}: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail="An unexpected internal error occurred.")
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
