@@ -41,7 +41,8 @@ services:
 
   storage-node-1:
     build:
-      context: ./storage-node
+      context: ./storage-node        # builds from here
+    image: haystackfilesystem-storage-node:latest 
     hostname: storage-node-1
     volumes:
       - ./storage-node/data1:/data       # unique data folder
@@ -54,8 +55,7 @@ services:
       - directory-service
 
   storage-node-2:
-    build:
-      context: ./storage-node
+    image: haystackfilesystem-storage-node:latest
     hostname: storage-node-2
     volumes:
       - ./storage-node/data2:/data       # unique data folder

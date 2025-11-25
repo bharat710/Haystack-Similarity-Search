@@ -5,4 +5,4 @@ redis
 python-logging-loki
 requests
 httpx
-
+pika

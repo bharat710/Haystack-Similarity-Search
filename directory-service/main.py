@@ -10,6 +10,8 @@ import logging
 import logging_loki
 import threading
 import time
+import pika
+import json
 
 # --- Models ---
 class UploadRequest(BaseModel):
@@ -30,10 +32,9 @@ class NodeHeartbeatRequest(BaseModel):
 
 
 # --- Setup ---
-HOSTNAME = os.environ.get("HOSTNAME")
 handler = logging_loki.LokiHandler(
     url="http://loki:3100/loki/api/v1/push",
-    tags={"application": f"{HOSTNAME}"},
+    tags={"application": "directory-service"},
     version="1",
 )
 logger = logging.getLogger("directory-service-logger")
@@ -46,8 +47,15 @@ app = FastAPI()
 DATABASE_URL = os.environ.get("DATABASE_URL")
 REDIS_HOST = "redis"
 REDIS_PORT = 6379
+RABBITMQ_HOST = os.environ.get("RABBITMQ_HOST", "rabbitmq")
 VOLUME_MAX_SIZE_BYTES = 100 * 1024 * 1024  # 100MB
+HOSTNAME = os.environ.get("HOSTNAME")
 HEARTBEAT_TTL=60
+
+# RabbitMQ Exchanges
+COMPACTION_TRIGGER_EXCHANGE = 'compaction_trigger_exchange'
+COMPACTION_START_EXCHANGE = 'compaction_start_exchange'
+COMPACTION_COMPLETE_EXCHANGE = 'compaction_complete_exchange'
 
 # This redis client is for service discovery
 try:
@@ -57,6 +65,16 @@ try:
 except redis.exceptions.ConnectionError as e:
     logger.error(f"Could not connect to Redis for service discovery: {e}")
     discovery_client = None
+
+# This redis client is for compaction tracking
+try:
+    compaction_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=1, decode_responses=True)
+    compaction_client.ping()
+    logger.info("Successfully connected to Redis for compaction tracking.")
+except redis.exceptions.ConnectionError as e:
+    logger.error(f"Could not connect to Redis for compaction tracking: {e}")
+    compaction_client = None
+
 
 # --- DB Connection ---
 def get_db_connection():
@@ -409,6 +427,280 @@ def mark_deleted(photo_id: str, db: psycopg2.extensions.connection = Depends(get
 
 
 #-FIXED-
+# --- RabbitMQ Functions ---
+def get_rabbitmq_connection():
+    """Creates and returns a new RabbitMQ connection."""
+    return pika.BlockingConnection(pika.ConnectionParameters(host=RABBITMQ_HOST))
+
+def publish_event(exchange, routing_key, message, exchange_type='direct'):
+    """Publishes an event to a RabbitMQ exchange."""
+    try:
+        connection = get_rabbitmq_connection()
+        channel = connection.channel()
+        channel.exchange_declare(exchange=exchange, exchange_type=exchange_type, durable=True)
+        channel.basic_publish(
+            exchange=exchange,
+            routing_key=routing_key,
+            body=json.dumps(message),
+            properties=pika.BasicProperties(delivery_mode=2)
+        )
+        connection.close()
+        logger.info(f"Published event to exchange '{exchange}' with routing key '{routing_key}': {message}")
+    except pika.exceptions.AMQPError as e:
+        logger.error(f"Failed to publish RabbitMQ event to exchange '{exchange}': {e}")
+
+
+def on_compaction_trigger(ch, method, properties, body):
+    """
+    Handles the COMPACTION_TRIGGER event.
+    This function is the entry point for starting a volume compaction cycle.
+    """
+    try:
+        data = json.loads(body)
+        volume_id = data.get('volume_id')
+        if not volume_id:
+            logger.error(f"Invalid COMPACTION_TRIGGER message: {data}")
+            ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+            return
+
+        logger.info(f"Received COMPACTION_TRIGGER for volume {volume_id}")
+
+        # Use a Redis lock to prevent race conditions where multiple triggers
+        # for the same volume are received at once.
+        lock_key = f"compaction_lock:{volume_id}"
+        compaction_lock = compaction_client.lock(lock_key, timeout=60)
+        if not compaction_lock.acquire(blocking=False):
+            logger.warning(f"Compaction for volume {volume_id} is already in progress. Ignoring trigger.")
+            ch.basic_ack(delivery_tag=method.delivery_tag) # Acknowledge message to remove from queue
+            return
+        
+        db_conn = None
+        try:
+            db_conn = get_db_connection()
+            with db_conn.cursor(cursor_factory=DictCursor) as cur:
+                # 1. Check volume status and get replica count
+                cur.execute(
+                    "SELECT status FROM logical_volumes WHERE volume_id = %s FOR UPDATE",
+                    (volume_id,)
+                )
+                volume_status = cur.fetchone()
+                if not volume_status or volume_status['status'] != 'writable':
+                    logger.warning(f"Volume {volume_id} is not in a writable state. Current status: {volume_status['status'] if volume_status else 'not found'}. Aborting compaction.")
+                    ch.basic_ack(delivery_tag=method.delivery_tag)
+                    db_conn.commit() # Release row lock
+                    return
+
+                cur.execute("SELECT COUNT(id) FROM volume_replicas WHERE volume_id = %s", (volume_id,))
+                replica_count = cur.fetchone()[0]
+
+                if replica_count == 0:
+                    logger.warning(f"No replicas found for volume {volume_id}. Nothing to compact.")
+                    ch.basic_ack(delivery_tag=method.delivery_tag)
+                    db_conn.commit()
+                    return
+
+                # 2. Update volume status to readonly
+                cur.execute(
+                    "UPDATE logical_volumes SET status = 'readonly' WHERE volume_id = %s",
+                    (volume_id,)
+                )
+                logger.info(f"Marked volume {volume_id} as readonly.")
+                
+                # 3. Generate a round_id and set up tracking in Redis
+                round_id = str(uuid.uuid4())
+                compaction_client.set(f"compaction:{round_id}:pending_replicas", replica_count)
+                
+                # 4. Broadcast the compaction start event
+                publish_event(
+                    exchange=COMPACTION_START_EXCHANGE,
+                    routing_key='', # Routing key is ignored for fanout exchanges
+                    message={"volume_id": volume_id, "round_id": round_id},
+                    exchange_type='fanout'
+                )
+                logger.info(f"Broadcasted COMPACTION_START for volume {volume_id} with round_id {round_id}")
+            
+            db_conn.commit()
+            ch.basic_ack(delivery_tag=method.delivery_tag)
+
+        except Exception as e:
+            logger.error(f"Error during compaction trigger for volume {volume_id}: {e}", exc_info=True)
+            if db_conn:
+                db_conn.rollback()
+            ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True) # Requeue on failure
+        finally:
+            if db_conn:
+                db_conn.close()
+            compaction_lock.release()
+
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to decode RabbitMQ message body: {e}")
+        ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+    except Exception as e:
+        logger.error(f"Unexpected error in on_compaction_trigger: {e}", exc_info=True)
+        ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+
+
+def on_compaction_complete(ch, method, properties, body):
+    """
+    Handles the COMPACTION_COMPLETE event.
+    Tracks the progress of compaction across all replicas.
+    """
+    try:
+        data = json.loads(body)
+        volume_id = data.get('volume_id')
+        round_id = data.get('round_id')
+        storage_node_id = data.get('storage_node_id')
+        new_size = data.get('new_size')
+
+        if not all([volume_id, round_id, storage_node_id, new_size is not None]):
+            logger.error(f"Invalid COMPACTION_COMPLETE message: {data}")
+            ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+            return
+
+        logger.info(f"Received COMPACTION_COMPLETE from {storage_node_id} for volume {volume_id}, round {round_id}")
+
+        # Check if this compaction round is still active
+        pending_replicas_key = f"compaction:{round_id}:pending_replicas"
+        if not compaction_client.exists(pending_replicas_key):
+            logger.warning(f"Compaction round {round_id} no longer active. Ignoring completion message from {storage_node_id}.")
+            ch.basic_ack(delivery_tag=method.delivery_tag)
+            return
+
+        # Store the new size reported by the node
+        sizes_key = f"compaction:{round_id}:sizes"
+        compaction_client.hset(sizes_key, storage_node_id, new_size)
+
+        # Decrement the counter for pending replicas
+        remaining_replicas = compaction_client.decr(pending_replicas_key)
+
+        if remaining_replicas == 0:
+            logger.info(f"All replicas for volume {volume_id} (round {round_id}) have completed compaction. Finalizing...")
+            # Use a thread to avoid blocking the consumer
+            finalization_thread = threading.Thread(
+                target=finalize_compaction,
+                args=(volume_id, round_id)
+            )
+            finalization_thread.start()
+        
+        elif remaining_replicas < 0:
+             logger.warning(f"Compaction counter for round {round_id} is negative. This may indicate duplicate 'complete' messages.")
+
+        ch.basic_ack(delivery_tag=method.delivery_tag)
+
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to decode RabbitMQ message body: {e}")
+        ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+    except Exception as e:
+        logger.error(f"Unexpected error in on_compaction_complete: {e}", exc_info=True)
+        ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+
+
+def finalize_compaction(volume_id, round_id):
+    """
+    Finalizes the compaction process for a volume.
+    - Deletes 'deleted' photo entries from the database.
+    - Updates the volume's size.
+    - Sets the volume back to 'writable'.
+    - Cleans up tracking keys in Redis.
+    """
+    db_conn = None
+    lock_key = f"compaction_lock:{volume_id}"
+    compaction_lock = compaction_client.lock(lock_key, timeout=60)
+    
+    try:
+        # Re-acquire lock to ensure no other process interferes during finalization
+        acquired = compaction_lock.acquire(blocking=True, blocking_timeout=30)
+        if not acquired:
+            logger.error(f"Could not acquire lock for finalizing compaction on volume {volume_id}. Aborting.")
+            return
+
+        db_conn = get_db_connection()
+        with db_conn.cursor() as cur:
+            # 1. Get the new canonical size from the max of all reported sizes
+            sizes_key = f"compaction:{round_id}:sizes"
+            reported_sizes = compaction_client.hvals(sizes_key)
+            if not reported_sizes:
+                raise ValueError("No new sizes were reported for this compaction round.")
+            
+            new_volume_size = max(int(s) for s in reported_sizes)
+
+            # 2. Delete photo entries marked as 'deleted' for this volume
+            cur.execute(
+                "DELETE FROM photos WHERE volume_id = %s AND status = 'deleted'",
+                (volume_id,)
+            )
+            deleted_rows = cur.rowcount
+            logger.info(f"Deleted {deleted_rows} photo entries for volume {volume_id}.")
+
+            # 3. Update the volume's size and status
+            cur.execute(
+                "UPDATE logical_volumes SET current_size_bytes = %s, status = 'writable' WHERE volume_id = %s",
+                (new_volume_size, volume_id)
+            )
+            logger.info(f"Volume {volume_id} is now writable with new size {new_volume_size} bytes.")
+        
+        db_conn.commit()
+        logger.info(f"Successfully finalized compaction for volume {volume_id}, round {round_id}.")
+
+    except Exception as e:
+        logger.error(f"Failed to finalize compaction for volume {volume_id}: {e}", exc_info=True)
+        if db_conn:
+            db_conn.rollback()
+    finally:
+        # 4. Clean up all Redis keys for this compaction round
+        if compaction_client:
+            pending_replicas_key = f"compaction:{round_id}:pending_replicas"
+            sizes_key = f"compaction:{round_id}:sizes"
+            compaction_client.delete(pending_replicas_key, sizes_key)
+            logger.info(f"Cleaned up Redis tracking keys for round {round_id}.")
+        
+        # only release if we actually acquired it
+        if acquired:
+            try:
+                compaction_lock.release()
+            except redis.exceptions.LockError:
+                logger.warning(f"Tried to release lock for volume {volume_id}, but it was not owned.")
+        if db_conn:
+            db_conn.close()
+
+
+def rabbitmq_consumer_thread():
+    """The main thread for the RabbitMQ consumer."""
+    while True:
+        try:
+            connection = get_rabbitmq_connection()
+            channel = connection.channel()
+
+            # Declare exchanges
+            channel.exchange_declare(exchange=COMPACTION_TRIGGER_EXCHANGE, exchange_type='direct', durable=True)
+            channel.exchange_declare(exchange=COMPACTION_COMPLETE_EXCHANGE, exchange_type='direct', durable=True)
+
+            # Declare queues
+            trigger_queue = channel.queue_declare(queue='compaction_trigger_queue', durable=True)
+            complete_queue = channel.queue_declare(queue='compaction_complete_queue', durable=True)
+
+            # Bind queues
+            channel.queue_bind(exchange=COMPACTION_TRIGGER_EXCHANGE, queue=trigger_queue.method.queue, routing_key='compaction.trigger')
+            channel.queue_bind(exchange=COMPACTION_COMPLETE_EXCHANGE, queue=complete_queue.method.queue, routing_key='compaction.completed')
+
+            # Set up consumers
+            channel.basic_consume(queue=trigger_queue.method.queue, on_message_callback=on_compaction_trigger, auto_ack=False)
+            channel.basic_consume(queue=complete_queue.method.queue, on_message_callback=on_compaction_complete, auto_ack=False)
+
+            logger.info("RabbitMQ consumer is waiting for compaction messages.")
+            channel.start_consuming()
+        except pika.exceptions.AMQPConnectionError as e:
+            logger.error(f"RabbitMQ connection failed: {e}. Retrying in 5 seconds...")
+            time.sleep(5)
+        except Exception as e:
+            logger.error(f"RabbitMQ consumer error: {e}. Restarting...", exc_info=True)
+            if 'channel' in locals() and channel.is_open:
+                channel.close()
+            if 'connection' in locals() and connection.is_open:
+                connection.close()
+            time.sleep(5)
+
+
 #-FIXED-
 # --- Background Tasks ---
 def check_stale_nodes():
@@ -470,6 +762,11 @@ def startup_event():
     stale_node_checker_thread = threading.Thread(target=check_stale_nodes, daemon=True)
     stale_node_checker_thread.start()
     logger.info("Stale node checker thread started.")
+
+    # Start the RabbitMQ consumer thread
+    rabbitmq_thread = threading.Thread(target=rabbitmq_consumer_thread, daemon=True)
+    rabbitmq_thread.start()
+    logger.info("RabbitMQ consumer thread started.")
 
     # Initialize the database
     try:

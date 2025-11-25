@@ -1,8 +1,8 @@
 fastapi
-uvicorn[standard]
+uvicorn
 redis
 aiofiles
-python-multipart
-python-logging-loki
 requests
-httpx
+python-logging-loki
+pika
+python-multipart
