@@ -6,3 +6,4 @@ requests
 python-logging-loki
 pika
 python-multipart
+httpx

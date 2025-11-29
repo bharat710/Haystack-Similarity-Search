@@ -1,163 +1,187 @@
-import os
 import pika
-import requests
+import time
+import os
+import sys
 import torch
 import open_clip
-import numpy as np
 from PIL import Image
+import requests
 from io import BytesIO
+import numpy as np
+from sklearn.cluster import Birch
 import logging
-import threading
-import time
-from fastapi import FastAPI
-from dotenv import load_dotenv
+from logging_loki import LokiHandler
+import json
 import base64
 
-load_dotenv()
+# --- LOGGING ---
+LOKI_URL = os.environ.get("LOKI_URL", "http://loki:3100/loki/api/v1/push")
+handler = LokiHandler(
+    url=LOKI_URL,
+    tags={"application": "ai-worker"},
+    version="1",
+)
 
-# --- Setup ---
-# Using standard logging for now
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger("ai-worker-logger")
+logger = logging.getLogger("ai-worker")
+logger.setLevel(logging.INFO)
+logger.addHandler(handler)
 
-app = FastAPI()
-
-# --- Globals & Config ---
-# RabbitMQ Config
-RABBITMQ_HOST = os.environ.get("RABBITMQ_HOST", "rabbitmq")
-PHOTO_QUEUE = os.environ.get("PHOTO_QUEUE", "photo_processing_queue")
-
-# Service URLs
-STORAGE_NODE_URL = os.environ.get("STORAGE_NODE_URL", "http://storage-node:8080")
-SEARCH_SERVICE_URL = os.environ.get("SEARCH_SERVICE_URL", "http://search-service:8000")
-
-# AI Model
-MODEL_NAME = 'ViT-B-32-quickgelu'
-PRETRAINED_DATASET = 'laion400m_e32'
-model = None
-preprocess = None
+# --- CONFIGURATION ---
+RABBITMQ_HOST = os.environ.get("RABBITMQ_HOST", "localhost")
+PHOTO_QUEUE = "photo_processing_queue"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+MODEL_NAME = "ViT-B-32"
+PRETRAINED = "laion2b_s34b_b79k"
+SEARCH_SERVICE_URL = os.environ.get("SEARCH_SERVICE_URL", "http://localhost:8002")
+BATCH_SIZE = 10
+CF_TREE_DUMP_PATH = "cf_tree.dump"
+WORKER_ID = os.environ.get("HOSTNAME", f"ai-worker-{os.getpid()}")
 
 
-# --- AI Model Loading ---
-def load_model():
-    """Loads the OpenCLIP model and preprocessing transforms."""
-    global model, preprocess
+# ---  MODEL LOADING ---
+def load_model_and_preprocess():
+    logger.info(f"Loading OpenCLIP model {MODEL_NAME}...")
+    model, _, preprocess = open_clip.create_model_and_transforms(
+        MODEL_NAME,
+        pretrained=PRETRAINED
+    )
+    model.eval()
+    model.to(DEVICE)
+    logger.info(f"Model loaded on device: {DEVICE}")
+    return model, preprocess
+
+model, preprocess = load_model_and_preprocess()
+
+def get_photo_id_from_path(path:str):
+    return path.split('/')[-1]
+
+def generate_embedding(photo_path: str):
+    """
+    Downloads a photo, preprocesses it, and generates a 512-dim embedding.
+    """
     try:
-        logger.info(f"Loading AI model '{MODEL_NAME}' with '{PRETRAINED_DATASET}' weights...")
-        model, _, preprocess = open_clip.create_model_and_transforms(
-            MODEL_NAME, pretrained=PRETRAINED_DATASET, device="cpu"
-        )
-        model.eval() # Set model to evaluation mode
-        logger.info("AI model loaded successfully.")
-    except Exception as e:
-        logger.error(f"Fatal error: Could not load AI model. {e}")
-        # If the model can't load, the service is useless.
-        # In a real system, this might trigger a restart or alert.
-        raise
-
-# --- Worker Logic ---
-def process_photo_callback(ch, method, properties, body):
-    """The core function to process a photo from the queue."""
-    photo_id = body.decode('utf-8')
-    node_url = photo_id.split('/')[0]
-    logical_id = photo_id.split('/')[1]
-    photo_id = photo_id.split('/')[2]
-    logger.info(f"Received job for photo_id: {photo_id}")
-
-    # 1. Download image from Storage Node
-    try:
-        response = requests.get(f"http://{node_url}/photos/{logical_id}/{photo_id}", timeout=30)
+        logger.info(f"Generating embedding for: {photo_path}")
+        response = requests.get(photo_path, timeout=10)
         response.raise_for_status()
-        payload = response.json()
-        b64_data = payload["data"]
-        image_bytes = base64.b64decode(b64_data)
-        image = Image.open(BytesIO(image_bytes)).convert("RGB")
-        logger.info(f"Successfully downloaded image for photo_id: {photo_id}")
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Failed to download image for {photo_id}: {e}. Re-queueing.")
-        # Negative Acknowledgement: re-queue the message
-        ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
-        return
-
-    # 2. Generate feature vector
-    try:
+        
+        # Decode the JSON response from the storage node
+        json_response = response.json()
+        encoded_data = json_response['data']
+        photo_data = base64.b64decode(encoded_data)
+        
+        img = Image.open(BytesIO(photo_data)).convert("RGB")
+        
         with torch.no_grad():
-            image_tensor = preprocess(image).unsqueeze(0).to("cpu")
-            vector = model.encode_image(image_tensor)
-            vector /= vector.norm(dim=-1, keepdim=True) # Normalize the vector
-            vector_list = vector.cpu().numpy().flatten().tolist()
-        logger.info(f"Successfully generated vector for photo_id: {photo_id}")
-    except Exception as e:
-        logger.error(f"Failed to generate vector for {photo_id}: {e}. Discarding message.")
-        # Acknowledge the message to discard it, as retrying will likely fail again.
-        ch.basic_ack(delivery_tag=method.delivery_tag)
-        return
-
-    # 3. Send vector to Search Service
-    try:
-        payload = {"photo_uuid": photo_id, "vector": vector_list}
-        resp = requests.post(f"{SEARCH_SERVICE_URL}/add_vector/", json=payload, timeout=30)
-
-        if 400 <= resp.status_code < 500:
-            logger.error(
-                f"Permanent error {resp.status_code} for {photo_id}: {resp.text}. "
-                "Discarding message."
-            )
-            ch.basic_ack(delivery_tag=method.delivery_tag)
-            return
-
-        resp.raise_for_status()
-        logger.info(f"Successfully sent vector for {photo_id} to search service.")
+            x = preprocess(img).unsqueeze(0).to(DEVICE)
+            embedding = model.encode_image(x)
+            embedding /= embedding.norm(dim=-1, keepdim=True)
+            
+        return embedding.cpu().numpy().astype("float32")[0]
 
     except requests.exceptions.RequestException as e:
-        logger.error(f"Failed to send vector for {photo_id}: {e}. Re-queueing.")
-        ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
-        return
+        logger.error(f"Error downloading photo {photo_path}: {e}")
+    except (KeyError, json.JSONDecodeError) as e:
+        logger.error(f"Error parsing response from storage node for {photo_path}: {e}")
+    except Exception as e:
+        logger.error(f"Error generating embedding for {photo_path}: {e}")
+    return None
 
+# --- RABBITMQ & CLUSTERING ---
+class AIWorker:
+    def __init__(self):
+        self.local_birch = Birch(n_clusters=None, threshold=0.5, branching_factor=50)
+        self.photo_embeddings = []
+        self.photo_ids = []
+        self.connection = None
 
-    # 4. Acknowledge the RabbitMQ message (Job Done)
-    ch.basic_ack(delivery_tag=method.delivery_tag)
-    logger.info(f"Successfully completed job for photo_id: {photo_id}")
-
-
-def start_rabbitmq_consumer():
-    """Connects to RabbitMQ and starts consuming messages."""
-    while True:
-        try:
-            logger.info("Connecting to RabbitMQ...")
-            connection = pika.BlockingConnection(pika.ConnectionParameters(host=RABBITMQ_HOST))
-            channel = connection.channel()
-
-            # Ensure the queue exists
-            channel.queue_declare(queue=PHOTO_QUEUE, durable=True)
-            # Don't dispatch a new message to a worker until it has processed and acknowledged the previous one
-            channel.basic_qos(prefetch_count=1)
-            
-            channel.basic_consume(queue=PHOTO_QUEUE, on_message_callback=process_photo_callback)
-
-            logger.info(f"[*] Waiting for messages on queue '{PHOTO_QUEUE}'. To exit press CTRL+C")
-            channel.start_consuming()
-
-        except pika.exceptions.AMQPConnectionError as e:
-            logger.warning(f"RabbitMQ connection failed: {e}. Retrying in 5 seconds...")
-            time.sleep(5)
-        except Exception as e:
-            logger.error(f"An unexpected error occurred in RabbitMQ consumer: {e}. Restarting...")
-            time.sleep(5)
-
-
-# --- FastAPI Endpoints & Events ---
-@app.on_event("startup")
-def startup_event():
-    """On startup, load the model and start the RabbitMQ consumer in a background thread."""
-    load_model()
+    def connect_to_rabbitmq(self):
+        while not self.connection:
+            try:
+                logger.info(f"Connecting to RabbitMQ at {RABBITMQ_HOST}...")
+                self.connection = pika.BlockingConnection(pika.ConnectionParameters(host=RABBITMQ_HOST))
+            except pika.exceptions.AMQPConnectionError:
+                logger.error("Connection to RabbitMQ failed. Retrying in 5 seconds...")
+                time.sleep(5)
     
-    # Run the consumer in a separate thread to not block the FastAPI server
-    consumer_thread = threading.Thread(target=start_rabbitmq_consumer, daemon=True)
-    consumer_thread.start()
+    def start_consuming(self):
+        self.connect_to_rabbitmq()
+        channel = self.connection.channel()
+        channel.queue_declare(queue=PHOTO_QUEUE, durable=True)
+        logger.info("Successfully connected to RabbitMQ. Waiting for messages.")
 
-@app.get("/")
-def read_root():
-    return {"status": "AI Worker is running"}
+        channel.basic_consume(queue=PHOTO_QUEUE, on_message_callback=self.process_message)
+        channel.start_consuming()
 
-# The uvicorn command in the Dockerfile will run this.
+    def process_message(self, ch, method, properties, body):
+        photo_path = body.decode()
+        photo_id = get_photo_id_from_path(photo_path)
+        logger.info(f"\nReceived photo: {photo_path}")
+        
+        embedding = generate_embedding(photo_path)
+        
+        if embedding is not None:
+            logger.info(f"Generated embedding for photo_id {photo_id}")
+            
+            # Add to local data
+            self.photo_embeddings.append(embedding)
+            self.photo_ids.append(photo_id)
+            
+            # Update local BIRCH model
+            self.local_birch.partial_fit(np.array([embedding]))
+            logger.info(f"Added to local BIRCH model. Batch size is now {len(self.photo_ids)}.")
+            
+            # Check if batch is ready
+            if len(self.photo_ids) >= BATCH_SIZE:
+                self.send_batch_to_search_service()
+
+        ch.basic_ack(delivery_tag=method.delivery_tag)
+
+    def send_batch_to_search_service(self):
+        logger.info(f"Batch of {len(self.photo_ids)} reached. Sending to search service...")
+
+        if not self.photo_ids:
+            logger.warning("Batch is empty, skipping send.")
+            return
+        
+        # We need to send both the raw embeddings for storage and the
+        # subcluster centroids for the global BIRCH model.
+        
+        # Extract subcluster centroids from the leaf nodes of the local tree
+        subcluster_centers = self.local_birch.root_.subclusters_
+        leaf_centroids = [sc.centroid_ for sc in subcluster_centers]
+
+        payload = {
+            "worker_id": WORKER_ID,
+            "photo_ids": self.photo_ids,
+            "embeddings": [emb.tolist() for emb in self.photo_embeddings],
+            "subcluster_centroids": [centroid.tolist() for centroid in leaf_centroids]
+        }
+
+        try:
+            response = requests.post(f"{SEARCH_SERVICE_URL}/internal/update-summary", json=payload, timeout=30)
+            response.raise_for_status()
+            logger.info("Successfully sent batch to search service.")
+            
+            # Clear local batch after successful send
+            self.photo_embeddings = []
+            self.photo_ids = []
+            # The local_birch model is now stateful and is NOT reset.
+
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error sending batch to search service: {e}")
+            # In a real system, you'd add retry logic or a dead-letter queue here.
+
+
+def main():
+    worker = AIWorker()
+    worker.start_consuming()
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        logger.info("Interrupted")
+        try:
+            sys.exit(0)
+        except SystemExit:
+            os._exit(0)

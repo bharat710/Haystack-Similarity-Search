@@ -24,6 +24,11 @@ class CommitRequest(BaseModel):
 
 class NodeRegistryRequest(BaseModel):
     url: str
+    status: str = 'active'
+
+class UpdateNodeStatusRequest(BaseModel):
+    url: str
+    status: str
 
 #-FIXED-
 class NodeHeartbeatRequest(BaseModel):
@@ -153,19 +158,23 @@ def register_storage_node(req: NodeRegistryRequest, db: psycopg2.extensions.conn
     """
     Allows storage nodes to register themselves.
     On conflict (if URL already exists), it updates the last_heartbeat and status.
+    A node can register in 'recovering' state.
     """
     with db.cursor() as cur:
         try:
+            # It's important that a node trying to recover isn't accidentally marked active.
+            # However, if an active node re-registers, it should stay active.
+            # The `EXCLUDED` keyword refers to the values that were proposed in the INSERT.
             cur.execute("""
                 INSERT INTO storage_nodes (url, status, last_heartbeat)
-                VALUES (%s, 'active', NOW())
+                VALUES (%s, %s, NOW())
                 ON CONFLICT (url) DO UPDATE SET
-                    status = 'active',
+                    status = EXCLUDED.status,
                     last_heartbeat = NOW();
-            """, (req.url,))
+            """, (req.url, req.status))
             db.commit()
-            logger.info(f"Registered or updated storage node: {req.url}")
-            return {"status": "success", "url": req.url}
+            logger.info(f"Registered or updated storage node: {req.url} with status: {req.status}")
+            return {"status": "success", "url": req.url, "state": req.status}
         except Exception as e:
             db.rollback()
             logger.error(f"Failed to register storage node {req.url}: {e}")
@@ -199,6 +208,72 @@ def storage_node_heartbeat(req: NodeHeartbeatRequest, db: psycopg2.extensions.co
             db.rollback()
             logger.error(f"Failed to process heartbeat from {req.url}: {e}")
             raise HTTPException(status_code=500, detail="Failed to process heartbeat")
+
+
+@app.post("/update_node_status")
+def update_node_status(req: UpdateNodeStatusRequest, db: psycopg2.extensions.connection = Depends(get_db)):
+    """Allows a storage node to update its own status (e.g., from 'recovering' to 'active')."""
+    with db.cursor() as cur:
+        try:
+            cur.execute(
+                "UPDATE storage_nodes SET status = %s WHERE url = %s",
+                (req.status, req.url)
+            )
+            if cur.rowcount == 0:
+                raise HTTPException(status_code=404, detail=f"Node not found: {req.url}")
+            db.commit()
+            logger.info(f"Updated status for node {req.url} to {req.status}")
+            return {"status": "success", "url": req.url, "new_status": req.status}
+        except Exception as e:
+            db.rollback()
+            logger.error(f"Failed to update status for node {req.url}: {e}")
+            raise HTTPException(status_code=500, detail="Failed to update node status")
+
+@app.get("/get_peer_replicas/{node_url:path}")
+def get_peer_replicas(node_url: str, db: psycopg2.extensions.connection = Depends(get_db)):
+    """
+    For a given recovering node, finds all the volumes it is a part of
+    and returns the other active peers for each of those volumes.
+    The node_url is passed as a path parameter.
+    """
+    peers_by_volume = {}
+    with db.cursor(cursor_factory=DictCursor) as cur:
+        try:
+            # 1. Find the node's internal ID
+            cur.execute("SELECT id FROM storage_nodes WHERE url = %s", (node_url,))
+            node_record = cur.fetchone()
+            if not node_record:
+                raise HTTPException(status_code=404, detail=f"Node not found: {node_url}")
+            node_id = node_record['id']
+
+            # 2. Find all volumes this node is a replica for
+            cur.execute("SELECT volume_id FROM volume_replicas WHERE storage_node_id = %s", (node_id,))
+            volumes = [row['volume_id'] for row in cur.fetchall()]
+
+            if not volumes:
+                logger.info(f"Node {node_url} has no volumes assigned. No peers to return.")
+                return {}
+
+            # 3. For each volume, find its active peer replicas
+            for volume_id in volumes:
+                cur.execute("""
+                    SELECT sn.url
+                    FROM volume_replicas vr
+                    JOIN storage_nodes sn ON vr.storage_node_id = sn.id
+                    WHERE vr.volume_id = %s
+                      AND sn.status = 'active'
+                      AND vr.storage_node_id != %s
+                """, (volume_id, node_id))
+                
+                peers = [row['url'] for row in cur.fetchall()]
+                if peers:
+                    peers_by_volume[volume_id] = peers
+
+            logger.info(f"Found peer replicas for node {node_url}: {peers_by_volume}")
+            return peers_by_volume
+        except Exception as e:
+            logger.error(f"Failed to get peer replicas for node {node_url}: {e}")
+            raise HTTPException(status_code=500, detail="Failed to retrieve peer replica information")
 
 
 #-FIXED-
@@ -278,8 +353,8 @@ async def request_upload_location(req: UploadRequest, db: psycopg2.extensions.co
                 try:
                     # Ask the storage node to create a new volume
                     # The storage node generates its own physical volume ID, we just need to ensure it's created
-                    res = requests.post(f"http://{node['url']}/create_volume")
-                    res.raise_for_status()
+                    # res = requests.post(f"http://{node['url']}/create_volume")
+                    # res.raise_for_status()
                     # We don't use the returned volume_id from storage node here,
                     # as our logical_volume_id is canonical.
                     
@@ -478,7 +553,7 @@ def on_compaction_trigger(ch, method, properties, body):
         try:
             db_conn = get_db_connection()
             with db_conn.cursor(cursor_factory=DictCursor) as cur:
-                # 1. Check volume status and get replica count
+                # 1. Check volume status and get active replica count
                 cur.execute(
                     "SELECT status FROM logical_volumes WHERE volume_id = %s FOR UPDATE",
                     (volume_id,)
@@ -490,11 +565,16 @@ def on_compaction_trigger(ch, method, properties, body):
                     db_conn.commit() # Release row lock
                     return
 
-                cur.execute("SELECT COUNT(id) FROM volume_replicas WHERE volume_id = %s", (volume_id,))
+                cur.execute("""
+                    SELECT COUNT(vr.id)
+                    FROM volume_replicas vr
+                    JOIN storage_nodes sn ON vr.storage_node_id = sn.id
+                    WHERE vr.volume_id = %s AND sn.status = 'active'
+                """, (volume_id,))
                 replica_count = cur.fetchone()[0]
 
                 if replica_count == 0:
-                    logger.warning(f"No replicas found for volume {volume_id}. Nothing to compact.")
+                    logger.warning(f"No active replicas found for volume {volume_id}. Nothing to compact.")
                     ch.basic_ack(delivery_tag=method.delivery_tag)
                     db_conn.commit()
                     return

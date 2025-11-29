@@ -6,6 +6,7 @@ import requests
 import time
 import asyncio
 import threading
+import httpx
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.responses import JSONResponse
 import logging
@@ -34,7 +35,6 @@ STORAGE_PATH = os.environ.get("STORAGE_PATH", "/data")
 DIRECTORY_SERVICE_URL = "http://directory-service:8000"
 storage_node_id = os.environ.get("HOSTNAME", "storage-node") + ":8080"
 MY_URL = f"http://{storage_node_id}"
-INDEX_FILE = os.path.join(STORAGE_PATH, "index.jsonl")
 COMPACTION_FRAGMENTATION_THRESHOLD = 0.2  # 20%
 
 # RabbitMQ Exchanges
@@ -67,14 +67,15 @@ def get_service_url(service_name: str) -> str:
     return f"http://{service_address}"
 
 
-async def append_to_index(photo_id: str, metadata: dict):
-    """Appends a metadata entry to the index file."""
+async def append_to_index(volume_id: str, photo_id: str, metadata: dict):
+    """Appends a metadata entry to the volume-specific index file."""
     try:
+        index_path = os.path.join(STORAGE_PATH, f"{volume_id}.index.jsonl")
         record = {"photo_id": photo_id, **metadata}
-        async with aiofiles.open(INDEX_FILE, "a") as f:
+        async with aiofiles.open(index_path, "a") as f:
             await f.write(json.dumps(record) + "\n")
     except Exception as e:
-        logger.error(f"Failed to append to index file for photo {photo_id}: {e}")
+        logger.error(f"Failed to append to index file for photo {photo_id} in volume {volume_id}: {e}")
 
 # --- RabbitMQ Functions ---
 
@@ -198,20 +199,20 @@ async def get_photo(logical_volume_id: str, photo_id: str):
         logger.error(f"Error retrieving photo {photo_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve photo: {e}")
 
-@app.post("/create_volume")
-async def create_volume():
-    """Creates a new, empty volume file and returns its ID."""
-    try:
-        new_volume_id = str(uuid.uuid4())
-        volume_path = os.path.join(STORAGE_PATH, f"{new_volume_id}.dat")
-        async with aiofiles.open(volume_path, "wb") as f:
-            await f.write(b"") 
+# @app.post("/create_volume")
+# async def create_volume():
+#     """Creates a new, empty volume file and returns its ID."""
+#     try:
+#         new_volume_id = str(uuid.uuid4())
+#         volume_path = os.path.join(STORAGE_PATH, f"{new_volume_id}.dat")
+#         async with aiofiles.open(volume_path, "wb") as f:
+#             await f.write(b"") 
         
-        logger.info(f"Created new volume: {new_volume_id} at {volume_path}")
-        return {"volume_id": new_volume_id}
-    except Exception as e:
-        logger.error(f"Failed to create new volume: {e}")
-        raise HTTPException(status_code=500, detail="Failed to create new volume file.")
+#         logger.info(f"Created new volume: {new_volume_id} at {volume_path}")
+#         return {"volume_id": new_volume_id}
+#     except Exception as e:
+#         logger.error(f"Failed to create new volume: {e}")
+#         raise HTTPException(status_code=500, detail="Failed to create new volume file.")
 
 @app.post("/upload/{volume_id}/{photo_id}")
 async def upload_photo(volume_id: str, photo_id: str, file: UploadFile = File(...)):
@@ -254,7 +255,7 @@ async def upload_photo(volume_id: str, photo_id: str, file: UploadFile = File(..
             pipeline.hincrby(f"volume_stats:{volume_id}", "total_photos", 1)
             pipeline.execute()
             
-            await append_to_index(photo_id, metadata_to_save)
+            await append_to_index(volume_id, photo_id, metadata_to_save)
             logger.info(f"Saved photo {photo_id} to {volume_path} at offset {offset}, size {size}")
             return {"status": "saved", "photo_id": photo_id, **metadata_to_save}
         except Exception as e:
@@ -281,7 +282,7 @@ async def delete_photo(photo_id: str):
         pipeline.hincrby(f"volume_stats:{volume_id}", "deleted_photos", 1)
         results = pipeline.execute()
 
-        await append_to_index(photo_id, {"status": "deleted"})
+        await append_to_index(volume_id, photo_id, {"status": "deleted"})
         logger.info(f"Marked photo {photo_id} in volume {volume_id} as deleted.")
 
         # --- Compaction Trigger Logic ---
@@ -345,7 +346,7 @@ async def run_compaction(volume_id: str, round_id: str):
                             pipeline = redis_client.pipeline()
                             pipeline.hset(key, "offset", new_offset)
                             pipeline.execute()
-                            await append_to_index(photo_id, {"offset": new_offset})
+                            await append_to_index(volume_id, photo_id, {"offset": new_offset})
                             
                             logger.debug(f"Copied {photo_id} to new volume. New offset: {new_offset}")
                             new_offset += original_size
@@ -394,59 +395,250 @@ def connect_to_redis():
             logger.warning(f"Could not connect to Redis: {e}. Retrying in 5s...")
             time.sleep(5)
 
-def register_with_directory():
+def register_with_directory(status: str = 'active'):
     """Registers this node with the directory service, with retry logic."""
     while True:
         try:
-            DIRECTORY_SERVICE_URL = get_service_url("directory-service")
-            response = requests.post(f"{DIRECTORY_SERVICE_URL}/register_storage_node", json={"url": storage_node_id})
+            # Use the base URL for initial registration; service discovery may not be ready.
+            response = requests.post(f"{DIRECTORY_SERVICE_URL}/register_storage_node", json={"url": storage_node_id, "status": status})
             response.raise_for_status()
-            logger.info("Successfully registered with Directory Service.")
-            break
+            logger.info(f"Successfully registered with Directory Service with status '{status}'.")
+            return response.json()
         except requests.exceptions.RequestException as e:
             logger.warning(f"Failed to register with Directory Service: {e}. Retrying in 5s...")
             time.sleep(5)
 
-def recover_metadata_from_index():
-    """Reads the index file and repopulates Redis with metadata and volume stats."""
-    if not os.path.exists(INDEX_FILE):
-        logger.info("Index file not found. Skipping recovery.")
-        return
-
-    logger.info("Starting metadata recovery from index file...")
-    volume_stats = {}
+def recover_metadata_from_indices():
+    """Scans for all index files (*.index.jsonl) and repopulates Redis."""
+    logger.info("Starting metadata recovery from index files...")
+    # This will hold the final state of each photo by replaying the logs
+    photo_states = {}
+    
     try:
-        with open(INDEX_FILE, "r") as f:
-            for line in f:
-                try:
-                    record = json.loads(line)
-                    photo_id = record.pop("photo_id")
-                    
-                    metadata_key = f"photo_metadata:{photo_id}"
-                    redis_client.hset(metadata_key, mapping=record)
-                    
-                    # Re-calculate volume stats during recovery
-                    if 'volume_id' in record and record.get('status') != 'deleted':
-                        vol_id = record['volume_id']
-                        stats = volume_stats.setdefault(vol_id, {'total': 0, 'deleted': 0})
-                        stats['total'] += 1
-                    if record.get('status') == 'deleted':
-                        vol_id = redis_client.hget(metadata_key, "volume_id") # Get vol_id for deleted photo
-                        if vol_id:
-                           stats = volume_stats.setdefault(vol_id, {'total': 0, 'deleted': 0})
-                           stats['deleted'] += 1
-                    
-                    logger.debug(f"Recovered metadata for photo {photo_id}")
-                except (json.JSONDecodeError, KeyError) as e:
-                    logger.warning(f"Skipping corrupt line/record in index file: {line.strip()} ({e})")
-        
+        os.makedirs(STORAGE_PATH, exist_ok=True)
+        for filename in os.listdir(STORAGE_PATH):
+            if not filename.endswith(".index.jsonl"):
+                continue
+            
+            index_path = os.path.join(STORAGE_PATH, filename)
+            logger.info(f"Processing index: {index_path}")
+
+            with open(index_path, "r") as f:
+                for line in f:
+                    try:
+                        record = json.loads(line)
+                        photo_id = record["photo_id"]
+                        
+                        # Overwrite previous state with the newer one from the log
+                        current_state = photo_states.get(photo_id, {})
+                        current_state.update(record)
+                        photo_states[photo_id] = current_state
+
+                    except (json.JSONDecodeError, KeyError) as e:
+                        logger.warning(f"Skipping corrupt line in {index_path}: {line.strip()} ({e})")
+
+        # Now, populate Redis with the final, authoritative state
+        volume_stats = {}
+        for photo_id, final_state in photo_states.items():
+            final_state.pop("photo_id", None) # Remove photo_id from the hash mapping
+            redis_client.hset(f"photo_metadata:{photo_id}", mapping=final_state)
+
+            # Recalculate stats based on the final state of each photo
+            if 'volume_id' in final_state:
+                vol_id = final_state['volume_id']
+                stats = volume_stats.setdefault(vol_id, {'total_photos': 0, 'deleted_photos': 0})
+                
+                if final_state.get('status') == 'deleted':
+                    stats['deleted_photos'] += 1
+                else:
+                    # Only count as a "total" photo if it's not deleted
+                    stats['total_photos'] += 1
+
         # Save calculated stats to Redis
         for vol_id, stats in volume_stats.items():
-            redis_client.hset(f"volume_stats:{vol_id}", "total_photos", stats['total'])
-            redis_client.hset(f"volume_stats:{vol_id}", "deleted_photos", stats['deleted'])
+            redis_client.hset(f"volume_stats:{vol_id}", mapping=stats)
+        
         logger.info("Metadata and volume stats recovery complete.")
     except Exception as e:
-        logger.error(f"Failed to read or process index file: {e}")
+        logger.error(f"Failed during metadata recovery: {e}", exc_info=True)
+
+# --- Recovery and Synchronization Logic ---
+
+async def update_status_with_directory(status: str):
+    """Updates this node's status with the directory service."""
+    async with httpx.AsyncClient() as client:
+        try:
+            logger.info(f"Updating status with directory service to '{status}'...")
+            response = await client.post(f"{DIRECTORY_SERVICE_URL}/update_node_status", json={"url": storage_node_id, "status": status})
+            response.raise_for_status()
+            logger.info("Successfully updated status with Directory Service.")
+        except httpx.HTTPError as e:
+            logger.error(f"Failed to update status with Directory Service: {e}")
+            # This is a critical failure, might need more robust handling (e.g., shutdown)
+            raise
+
+async def synchronize_volume(volume_id: str, peers: list):
+    """
+    Synchronizes a single volume from a healthy peer using the 'Wipe and Replace' strategy.
+    """
+    logger.info(f"Starting synchronization for volume {volume_id} from peers: {peers}")
+    if not peers:
+        logger.warning(f"No active peers found for volume {volume_id}. Cannot synchronize.")
+        return
+
+    peer_url = peers[0] # Try first peer. A more robust solution would iterate.
+    async with httpx.AsyncClient(timeout=300.0) as client:
+        try:
+            # 1. Compare metadata with peer to see if a full sync is needed.
+            local_index_path = os.path.join(STORAGE_PATH, f"{volume_id}.index.jsonl")
+            local_line_count = 0
+            if os.path.exists(local_index_path):
+                async with aiofiles.open(local_index_path, 'r') as f:
+                    local_line_count = sum(1 for line in await f.readlines())
+
+            metadata_url = f"http://{peer_url}/internal/sync/volume-metadata/{volume_id}"
+            response = await client.get(metadata_url)
+            response.raise_for_status()
+            peer_metadata = response.json()
+
+            if local_line_count >= peer_metadata.get("index_line_count", 0):
+                logger.info(f"Volume {volume_id} is up-to-date (local lines: {local_line_count}). No sync needed.")
+                return
+
+            logger.info(f"Volume {volume_id} is stale. Starting full sync from {peer_url}.")
+
+            # 2. Fetch full data dump from peer
+            sync_data_url = f"http://{peer_url}/internal/sync/volume-data/{volume_id}"
+            response = await client.get(sync_data_url)
+            response.raise_for_status()
+            data = response.json()
+
+            # 3. Lock, Wipe, and Replace local data
+            if volume_id not in volume_locks:
+                volume_locks[volume_id] = asyncio.Lock()
+            lock = volume_locks[volume_id]
+            async with lock:
+                logger.info(f"Wiping local data for volume {volume_id}")
+                # Delete Redis keys associated with this volume
+                keys_to_delete = [key for key in redis_client.scan_iter("photo_metadata:*") if redis_client.hget(key, "volume_id") == volume_id]
+                if keys_to_delete:
+                    redis_client.delete(*keys_to_delete)
+
+                # Prep new data
+                dat_content = base64.b64decode(data['dat_file'])
+                index_content = data['index_file']
+                redis_metadata = data['redis_metadata']
+
+                # Write to temp files first
+                temp_dat_path = os.path.join(STORAGE_PATH, f"{volume_id}.dat.tmp")
+                temp_index_path = os.path.join(STORAGE_PATH, f"{volume_id}.index.jsonl.tmp")
+
+                async with aiofiles.open(temp_dat_path, 'wb') as f:
+                    await f.write(dat_content)
+                async with aiofiles.open(temp_index_path, 'w') as f:
+                    await f.write(index_content)
+                
+                # Populate Redis
+                for photo_id, mapping in redis_metadata.items():
+                    redis_client.hset(f"photo_metadata:{photo_id}", mapping=mapping)
+
+                # Atomically replace old files
+                os.rename(temp_dat_path, os.path.join(STORAGE_PATH, f"{volume_id}.dat"))
+                os.rename(temp_index_path, local_index_path)
+
+            logger.info(f"Successfully synchronized volume {volume_id} from {peer_url}")
+
+        except httpx.HTTPError as e:
+            logger.error(f"HTTP error while synchronizing volume {volume_id} from peer {peer_url}: {e}")
+        except Exception as e:
+            logger.error(f"Unexpected error during sync for volume {volume_id}: {e}", exc_info=True)
+
+
+async def run_recovery_process():
+    """Orchestrates the node's recovery and synchronization process at startup."""
+    logger.info("--- Starting Recovery Process ---")
+    try:
+        # 1. Get this node's volumes and the active peers for each from the directory
+        encoded_node_id = requests.utils.quote(storage_node_id)
+        url = f"{DIRECTORY_SERVICE_URL}/get_peer_replicas/{encoded_node_id}"
+        async with httpx.AsyncClient() as client:
+            response = await client.get(url)
+            response.raise_for_status()
+            peers_by_volume = response.json()
+
+        if not peers_by_volume:
+            logger.info("No volumes assigned or no active peers found. Assuming this node is a source of truth.")
+            return
+
+        logger.info(f"Found peers for recovery: {peers_by_volume}")
+
+        # 2. Synchronize each volume concurrently
+        tasks = [synchronize_volume(volume_id, peers) for volume_id, peers in peers_by_volume.items()]
+        await asyncio.gather(*tasks)
+
+        logger.info("--- Recovery Process Finished ---")
+
+    except httpx.HTTPError as e:
+        logger.error(f"Could not contact directory service for recovery info: {e}")
+    except Exception as e:
+        logger.error(f"An unexpected error occurred during the recovery process: {e}", exc_info=True)
+
+
+@app.get("/internal/sync/volume-metadata/{volume_id}")
+async def get_volume_metadata(volume_id: str):
+    """Returns metadata about a volume for synchronization purposes."""
+    index_path = os.path.join(STORAGE_PATH, f"{volume_id}.index.jsonl")
+    if not os.path.exists(index_path):
+        raise HTTPException(status_code=404, detail="Volume index not found")
+    
+    async with aiofiles.open(index_path, 'r') as f:
+        line_count = sum(1 for _ in await f.readlines())
+    
+    return {"volume_id": volume_id, "index_line_count": line_count}
+
+@app.get("/internal/sync/volume-data/{volume_id}")
+async def get_volume_data(volume_id: str):
+    """Returns a full, consistent snapshot of a volume's data for synchronization."""
+    dat_path = os.path.join(STORAGE_PATH, f"{volume_id}.dat")
+    index_path = os.path.join(STORAGE_PATH, f"{volume_id}.index.jsonl")
+
+    if not os.path.exists(dat_path) or not os.path.exists(index_path):
+        raise HTTPException(status_code=404, detail="Volume data or index not found")
+
+    if volume_id not in volume_locks:
+        volume_locks[volume_id] = asyncio.Lock()
+    lock = volume_locks[volume_id]
+
+    async with lock: # Lock to prevent writes/compactions during a sync read
+        try:
+            # 1. Read files from disk
+            async with aiofiles.open(dat_path, 'rb') as f:
+                dat_content = await f.read()
+            async with aiofiles.open(index_path, 'r') as f:
+                index_content = await f.read()
+
+            # 2. Get all relevant metadata from Redis
+            redis_metadata = {}
+            keys = redis_client.scan_iter("photo_metadata:*")
+            for key in keys:
+                # hget is blocking, but should be fast enough. For extreme scale, a LUA script would be better.
+                if redis_client.hget(key, "volume_id") == volume_id:
+                    photo_id = key.split(":")[-1]
+                    redis_metadata[photo_id] = redis_client.hgetall(key)
+            
+            # 3. Base64 encode the binary .dat file for safe JSON transport
+            encoded_dat = base64.b64encode(dat_content).decode('utf-8')
+
+            return {
+                "volume_id": volume_id,
+                "dat_file": encoded_dat,
+                "index_file": index_content,
+                "redis_metadata": redis_metadata
+            }
+        except Exception as e:
+            logger.error(f"Failed to get sync data for volume {volume_id}: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail="Failed to prepare sync data")
+
 
 def heartbeat_to_directory():
     """Periodically sends a heartbeat to the directory service."""
@@ -462,22 +654,57 @@ def heartbeat_to_directory():
         time.sleep(HEARTBEAT_INTERVAL_SECONDS)
 
 @app.on_event("startup")
-def startup_event():
-    """On startup, connect to dependencies, start background threads, and register."""
+async def startup_event():
+    """
+    On startup, connect to dependencies, run recovery/synchronization, 
+    and then start background threads.
+    """
     global main_event_loop
-    main_event_loop = asyncio.get_running_loop()
+    try:
+        main_event_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # This might happen in tests or other contexts.
+        main_event_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(main_event_loop)
 
+
+    # --- Initial Setup ---
     connect_to_redis()
-    recover_metadata_from_index()
-    register_with_directory()
+    os.makedirs(STORAGE_PATH, exist_ok=True)
+    logger.info(f"Storage path '{STORAGE_PATH}' ensured.")
+
+    # --- Recovery and Registration ---
+    # This logic now runs asynchronously during startup before the server accepts traffic.
     
-    # Start background threads
+    # 1. Register as 'recovering' so we don't get traffic yet.
+    register_with_directory(status='recovering')
+    
+    # 2. Recover local state from our own index files first.
+    recover_metadata_from_indices()
+
+    # 3. Run the async recovery process to sync data from peers.
+    try:
+        logger.info("Starting peer data synchronization process...")
+        await run_recovery_process()
+    except Exception as e:
+        logger.critical(f"FATAL: Data recovery process failed: {e}. Shutting down.", exc_info=True)
+        # In a production system, you might want a more graceful failure.
+        exit(1)
+
+    # 4. Once recovery is complete, mark ourselves as 'active'.
+    try:
+        logger.info("Synchronization complete. Setting status to 'active'.")
+        await update_status_with_directory('active')
+    except Exception as e:
+        logger.critical(f"FATAL: Could not set status to 'active': {e}. Shutting down.", exc_info=True)
+        exit(1)
+
+    # --- Start Background Services ---
+    # Now that the node is healthy and active, start heartbeating and other services.
+    logger.info("Node is now fully active. Starting background threads.")
     threading.Thread(target=heartbeat_to_directory, daemon=True).start()
     threading.Thread(target=rabbitmq_consumer_thread, daemon=True).start()
     logger.info("Background threads (Heartbeat, RabbitMQ Consumer) started.")
-
-    os.makedirs(STORAGE_PATH, exist_ok=True)
-    logger.info(f"Storage path '{STORAGE_PATH}' ensured.")
 
 if __name__ == "__main__":
     import uvicorn

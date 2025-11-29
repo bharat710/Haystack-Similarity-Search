@@ -1,0 +1,6 @@
+nohup: ignoring input
+Found stopped containers. Restarting them...
+Restarting container: haystackfilesystem-storage-node-1-1
+haystackfilesystem-storage-node-1-1
+Restarting container: haystackfilesystem-logging-service-1
+haystackfilesystem-logging-service-1

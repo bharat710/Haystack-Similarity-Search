@@ -230,7 +230,9 @@ async def upload_photo(
         redis_client.set(idempotency_redis_key, photo_id, ex=IDEMPOTENCY_KEY_EXPIRY_SECONDS)
 
         # Publish message to RabbitMQ for AI processing
-        publish_photo_to_queue(f"{storage_node_urls[0]}/{volume_id}/{photo_id}")
+        # The message needs to be a full URL that the ai-worker can download
+        photo_url_for_worker = f"http://{storage_node_urls[0]}/photos/{volume_id}/{photo_id}"
+        publish_photo_to_queue(photo_url_for_worker)
         # if rabbitmq_channel:
         #     try:
         #         rabbitmq_channel.basic_publish(
@@ -396,6 +398,61 @@ async def delete_photo(photo_id: str):
         except Exception as e:
             logger.error(f"An unexpected error occurred during photo deletion for {photo_id}: {e}", exc_info=True)
             raise HTTPException(status_code=500, detail="An unexpected internal error occurred.")
+
+
+@app.get("/clusters")
+async def get_clusters():
+    """
+    Proxies the request to the search service to get all clusters.
+    """
+    search_service_url = get_service_url("search-service")
+    async with httpx.AsyncClient(timeout=HTTP_CLIENT_TIMEOUT) as client:
+        try:
+            response = await client.get(f"{search_service_url}/clusters")
+            response.raise_for_status()
+            return JSONResponse(content=response.json(), status_code=response.status_code)
+        except httpx.HTTPStatusError as e:
+            logger.error(f"HTTP error from search-service /clusters: {e.response.status_code} - {e.response.text}")
+            raise HTTPException(status_code=e.response.status_code, detail=e.response.json())
+        except httpx.RequestError as e:
+            logger.error(f"Request error to search-service /clusters: {e}")
+            raise HTTPException(status_code=502, detail="Search service is unavailable.")
+
+@app.get("/cluster/{cluster_id}")
+async def get_cluster_members(cluster_id: int):
+    """
+    Proxies the request to the search service to get members of a specific cluster.
+    """
+    search_service_url = get_service_url("search-service")
+    async with httpx.AsyncClient(timeout=HTTP_CLIENT_TIMEOUT) as client:
+        try:
+            response = await client.get(f"{search_service_url}/cluster/{cluster_id}")
+            response.raise_for_status()
+            return JSONResponse(content=response.json(), status_code=response.status_code)
+        except httpx.HTTPStatusError as e:
+            logger.error(f"HTTP error from search-service /cluster/{cluster_id}: {e.response.status_code} - {e.response.text}")
+            raise HTTPException(status_code=e.response.status_code, detail=e.response.json())
+        except httpx.RequestError as e:
+            logger.error(f"Request error to search-service /cluster/{cluster_id}: {e}")
+            raise HTTPException(status_code=502, detail="Search service is unavailable.")
+
+@app.post("/recluster")
+async def recluster_photos():
+    """
+    Proxies the recluster request to the search service.
+    """
+    search_service_url = get_service_url("search-service")
+    async with httpx.AsyncClient(timeout=HTTP_CLIENT_TIMEOUT) as client:
+        try:
+            response = await client.post(f"{search_service_url}/recluster")
+            response.raise_for_status()
+            return JSONResponse(content=response.json(), status_code=response.status_code)
+        except httpx.HTTPStatusError as e:
+            logger.error(f"HTTP error from search-service /recluster: {e.response.status_code} - {e.response.text}")
+            raise HTTPException(status_code=e.response.status_code, detail=e.response.json())
+        except httpx.RequestError as e:
+            logger.error(f"Request error to search-service /recluster: {e}")
+            raise HTTPException(status_code=502, detail="Search service is unavailable.")
 
 
 if __name__ == "__main__":
