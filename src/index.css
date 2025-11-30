@@ -1,0 +1,337 @@
+/* Global reset-ish */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  background: linear-gradient(180deg, #ffffff, #f6f6f8);
+  color: #222;
+}
+
+/* App Layout */
+.app-root {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+
+
+.app-header {
+  position: sticky;
+  top: 0;
+  z-index: 50;
+  backdrop-filter: blur(12px);
+  background: rgba(255, 255, 255, 0.8);
+  border-bottom: 1px solid rgba(200, 200, 200, 0.4);
+}
+
+.app-header-inner {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 0.75rem 1.5rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.brand {
+  font-weight: 700;
+  font-size: 1.25rem;
+  text-decoration: none;
+  color: #e60023;
+}
+
+.nav-links a {
+  margin-left: 1rem;
+  text-decoration: none;
+  color: #444;
+  font-size: 0.95rem;
+}
+
+.nav-links a:hover {
+  text-decoration: underline;
+}
+
+.app-main {
+  flex: 1;
+  padding: 1.5rem 0 2.5rem;
+}
+
+/* Page layout */
+.page {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 0 1.5rem;
+  box-shadow: 0 10px 35px rgba(0, 0, 0, 0.06);
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.9);
+  min-height: calc(100vh - 120px);
+}
+
+.page-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 1.25rem 0 0.75rem;
+  border-bottom: 1px solid rgba(230, 230, 230, 0.9);
+  margin-bottom: 1rem;
+}
+
+.page-header h1 {
+  margin: 0;
+  font-size: 1.35rem;
+}
+
+.page-header-left {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.photo-id-label {
+  font-size: 0.85rem;
+  color: #666;
+}
+
+.upload-status {
+  font-size: 0.85rem;
+  color: #888;
+}
+
+/* Back button */
+.back-btn {
+  border: none;
+  background: #f1f1f4;
+  padding: 0.35rem 0.75rem;
+  border-radius: 999px;
+  cursor: pointer;
+  font-size: 0.9rem;
+  margin-right: 0.25rem;
+}
+
+.back-btn:hover {
+  background: #e1e1e6;
+}
+
+/* Masonry Grid */
+.gallery-container {
+  margin: 1.25rem 0 2.5rem;
+}
+
+.masonry-grid {
+  display: flex;
+  width: 100%;
+}
+
+.masonry-column {
+  padding: 0 0.5rem;
+  background-clip: padding-box;
+}
+
+.masonry-column > div {
+  margin-bottom: 1rem;
+}
+
+/* Photo cards */
+.photo-card {
+  position: relative;
+  cursor: pointer;
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+
+.photo-card:hover {
+  transform: scale(1.03);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+}
+
+.photo-inner {
+  border-radius: 14px;
+  overflow: hidden;
+  background: #f4f4f6;
+  opacity: 0;
+  transition: opacity 0.4s ease;
+}
+
+.photo-inner.loaded {
+  opacity: 1;
+}
+
+.photo-img {
+  display: block;
+  width: 100%;
+  height: auto;
+  border-radius: 14px;
+}
+
+/* Skeleton loading card */
+.skeleton-card {
+  position: relative;
+  border-radius: 14px;
+  overflow: hidden;
+  background: #e5e5ea;
+  height: 200px;
+}
+
+.skeleton-shimmer {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    90deg,
+    #e5e5ea 0%,
+    #f2f2f7 40%,
+    #e5e5ea 80%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 1.2s infinite;
+}
+
+@keyframes shimmer {
+  0% {
+    background-position: -150% 0;
+  }
+  100% {
+    background-position: 150% 0;
+  }
+}
+
+/* Floating upload button */
+.upload-btn {
+  position: fixed;
+  right: 2rem;
+  bottom: 2rem;
+  width: 64px;
+  height: 64px;
+  border-radius: 50%;
+  border: none;
+  background: #ff4f70;
+  color: #fff;
+  font-size: 2rem;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 8px 25px rgba(0, 0, 0, 0.25);
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
+  z-index: 60;
+}
+
+.upload-btn:hover {
+  transform: scale(1.08);
+  box-shadow: 0 10px 32px rgba(0, 0, 0, 0.35);
+}
+
+/* Parent must be position: relative */
+.photo-inner {
+    position: relative;
+}
+
+/* Perfect bottom-right overlay button */
+.delete-button {
+    position: absolute;
+    bottom: 10px;
+    right: 10px;
+
+    padding: 6px 16px;
+    font-size: 13px;
+    font-weight: 600;
+
+    color: #c4001d;
+    background: rgba(255,255,255,0.8);
+
+    border-radius: 14px;
+    border: 1px solid rgba(200, 200, 200, 0.5);
+    cursor: pointer;
+    backdrop-filter: blur(6px);
+
+    box-shadow: 0 4px 15px rgba(0,0,0,0.15);
+
+    opacity: 0;
+    transform: translateY(6px);
+    animation: deleteFadeIn 0.15s forwards;
+    z-index: 30;
+}
+
+@keyframes deleteFadeIn {
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+.delete-button:hover {
+    background: rgba(255,240,240,0.9);
+    color: #9d0018;
+    box-shadow: 0 6px 20px rgba(0,0,0,0.25);
+}
+
+/* Small screens */
+@media (max-width: 768px) {
+  .page {
+    box-shadow: none;
+    border-radius: 0;
+    padding: 0 1rem 2.5rem;
+  }
+
+  .app-header-inner {
+    padding: 0.6rem 1rem;
+  }
+
+  .upload-btn {
+    right: 1.25rem;
+    bottom: 1.25rem;
+    width: 56px;
+    height: 56px;
+  }
+
+  /* Context menu overlay */
+.context-menu-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+}
+
+/* Context menu box */
+.context-menu {
+  position: absolute;
+  min-width: 140px;
+  background: #ffffff;
+  border-radius: 8px;
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.18);
+  padding: 4px 0;
+  animation: contextMenuFade 0.12s ease-out;
+  font-size: 0.9rem;
+}
+
+@keyframes contextMenuFade {
+  from {
+    opacity: 0;
+    transform: translateY(-3px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.context-menu-item {
+  width: 100%;
+  padding: 0.45rem 0.9rem;
+  background: transparent;
+  border: none;
+  text-align: left;
+  cursor: pointer;
+}
+
+.context-menu-item:hover {
+  background: #f3f3f7;
+}
+
+.context-menu-danger {
+  color: #c0182f;
+}
+}
